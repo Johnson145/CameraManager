@@ -573,8 +573,9 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
                 return
             }
         }
-        
-        imageCompletion(CaptureResult(image))
+        else {
+            imageCompletion(CaptureResult(image))
+        }        
     }
     
     fileprivate func _setVideoWithGPS(forLocation location: CLLocation) {
@@ -645,6 +646,8 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
             if let asset = asset {
                 imageCompletion(CaptureResult(asset))
             } else {
+                // TODO we couldn't save the captured image in the library, but we still can provide valid image data to the user.
+                // => we should provide both: the actual image data and an information about the failed library action
                 imageCompletion(.failure(CaptureError.assetNotSaved))
             }
         }
