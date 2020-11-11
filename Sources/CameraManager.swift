@@ -372,8 +372,6 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         return tempURL
     }
     
-    fileprivate var coreMotionManager: CMMotionManager!
-    
     /// Real device orientation from DeviceMotion
     fileprivate var deviceOrientation: UIDeviceOrientation = .portrait
     
@@ -1509,7 +1507,6 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
                     name: UIDevice.orientationDidChangeNotification,
                     object: nil
             )
-            coreMotionManager.stopDeviceMotionUpdates()
             cameraIsObservingDeviceOrientation = false
         }
     }
