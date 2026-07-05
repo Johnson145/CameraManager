@@ -105,6 +105,7 @@ public enum CaptureError: Error {
     case noVideoConnection
     case noSampleBuffer
     case assetNotSaved
+    case captureSessionNotRunning
 }
 
 /// Class for handling iDevices custom camera usage
@@ -689,6 +690,16 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         _updateIlluminationMode(flashMode)
         
         sessionQueue.async {
+            // `captureStillImageAsynchronously` raises an NSInternalInconsistencyException
+            // ("Inconsistent state") if it is invoked while the capture session is not running –
+            // e.g. when the shutter is triggered just as the session is torn down or interrupted
+            // (app backgrounding, incoming call). `cameraIsSetup` stays true across such
+            // interruptions, so guard on the live session state right before the capture instead
+            // of letting AVFoundation throw an uncatchable ObjC exception. See scanner_main #1511.
+            guard self.captureSession?.isRunning == true else {
+                imageCompletion(.failure(CaptureError.captureSessionNotRunning))
+                return
+            }
             let stillImageOutput = self._getStillImageOutput()
             if let connection = stillImageOutput.connection(with: AVMediaType.video),
                 connection.isEnabled {
