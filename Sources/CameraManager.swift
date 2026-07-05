@@ -749,14 +749,29 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
     /**
      Starts recording a video with or without voice as in the session preset.
      */
-    open func startRecordingVideo() {
+    @discardableResult
+    open func startRecordingVideo() -> Bool {
         guard cameraOutputMode != .stillImage else {
             _show(NSLocalizedString("Capture session output still image", comment: ""), message: NSLocalizedString("I can only take pictures", comment: ""))
-            return
+            return false
         }
-    
+
         let videoOutput = _getMovieOutput()
-        
+
+        // `startRecording(to:recordingDelegate:)` raises an uncatchable NSInvalidArgumentException
+        // ("*** No active/enabled connections") when it is invoked while the capture session is stopped
+        // or interrupted (app backgrounding, incoming call, camera resource taken by another app) – the
+        // movie file output then has no active, enabled video connection. `cameraIsSetup` stays true
+        // across such interruptions, so guard on the live session/connection state right before recording
+        // instead of letting AVFoundation throw. Return false so the caller can revert its recording
+        // state. Same family as the still-image guard in `capturePictureDataWithCompletion`. See
+        // scanner_main #1514 (#1511 for the still-image counterpart).
+        guard captureSession?.isRunning == true,
+            let videoConnection = videoOutput.connection(with: .video),
+            videoConnection.isActive, videoConnection.isEnabled else {
+            return false
+        }
+
         if shouldUseLocationServices {
             
             let specs = [kCMMetadataFormatDescriptionMetadataSpecificationKey_Identifier as String: AVMetadataIdentifier.quickTimeMetadataLocationISO6709,
@@ -767,7 +782,7 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
             
             // Create the metadata input and add it to the session.
             guard let captureSession = captureSession, let locationMetadata = locationMetadataDesc else {
-                return
+                return false
             }
             
             let newLocationMetadataInput = AVCaptureMetadataInput(formatDescription: locationMetadata, clock: CMClockGetHostTimeClock())
@@ -782,6 +797,7 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         _updateIlluminationMode(flashMode)
         
         videoOutput.startRecording(to: _tempFilePath(), recordingDelegate: self)
+        return true
     }
     
     /**
