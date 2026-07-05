@@ -453,7 +453,23 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
      Stops running capture session but all setup devices, inputs and outputs stay for further reuse.
      */
     open func stopCaptureSession() {
-        captureSession?.stopRunning()
+        // stopRunning() must run on the same serial sessionQueue as every
+        // beginConfiguration()/commitConfiguration() transaction. Calling it
+        // synchronously on the caller's thread (e.g. the main thread from a
+        // viewWillDisappear/resignActive path) can land it in the middle of an
+        // in-flight configuration transaction, which makes AVFoundation raise an
+        // uncatchable NSGenericException ("stopRunning may not be called between
+        // calls to beginConfiguration and commitConfiguration"). Dispatching it
+        // asynchronously serializes it after any pending transaction, mirroring
+        // how resumeCaptureSession() dispatches startRunning(). The strong
+        // capture keeps the session alive even if it is torn down right after.
+        if let validCaptureSession = captureSession {
+            sessionQueue.async {
+                if validCaptureSession.isRunning {
+                    validCaptureSession.stopRunning()
+                }
+            }
+        }
         _stopFollowingDeviceOrientation()
     }
     
