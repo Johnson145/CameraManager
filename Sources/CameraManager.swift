@@ -952,13 +952,19 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
     // MARK: - AVCaptureFileOutputRecordingDelegate
     
     public func fileOutput(_: AVCaptureFileOutput, didStartRecordingTo _: URL, from _: [AVCaptureConnection]) {
-        _onSessionQueueSync {
-            captureSession?.beginConfiguration()
-            if flashMode != .off {
-                _updateIlluminationMode(flashMode)
+        // Hop onto the session queue *asynchronously*: this delegate callback arrives on an
+        // AVFoundation-internal thread that may hold internal session locks. Blocking it with a
+        // synchronous hop while the queue concurrently runs e.g. stopRunning() (which takes those
+        // locks) could invert them into a deadlock. Nothing here needs to be synchronous — this
+        // only switches the torch on right after the recording started.
+        sessionQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.captureSession?.beginConfiguration()
+            if self.flashMode != .off {
+                self._updateIlluminationMode(self.flashMode)
             }
 
-            captureSession?.commitConfiguration()
+            self.captureSession?.commitConfiguration()
         }
     }
     
