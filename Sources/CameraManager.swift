@@ -343,7 +343,38 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
     fileprivate var videoCompletion: ((_ videoURL: URL?, _ error: NSError?) -> Void)?
     
     fileprivate var sessionQueue: DispatchQueue = DispatchQueue(label: "CameraSessionQueue", attributes: [])
-    
+
+    /// Identify `sessionQueue` so `_onSessionQueueSync` can detect whether it is already running on
+    /// it. Set up in `init`.
+    fileprivate let sessionQueueKey = DispatchSpecificKey<UUID>()
+    fileprivate let sessionQueueID = UUID()
+
+    override public init() {
+        super.init()
+        sessionQueue.setSpecific(key: sessionQueueKey, value: sessionQueueID)
+    }
+
+    /// Runs `block` synchronously on the serial `sessionQueue`, executing it inline when the caller
+    /// is already on that queue (so nested calls cannot deadlock).
+    ///
+    /// Every `beginConfiguration()`/`commitConfiguration()` transaction in this class must go
+    /// through this (or already run on `sessionQueue`): `stopCaptureSession()` dispatches
+    /// `stopRunning()` onto `sessionQueue`, and AVFoundation raises an uncatchable
+    /// NSGenericException ("stopRunning may not be called between calls to beginConfiguration and
+    /// commitConfiguration") whenever `stopRunning()` interleaves with a configuration transaction
+    /// that is still open on another thread (e.g. the main thread toggling flash/camera/output mode
+    /// while the app resigns active). Serializing only `stopRunning()` proved insufficient in
+    /// production — the transactions themselves have to run on the same queue.
+    ///
+    /// Deadlock safety: `sessionQueue` blocks only ever dispatch to the main queue *async*hronously,
+    /// so a synchronous hop from the main thread onto `sessionQueue` cannot deadlock.
+    fileprivate func _onSessionQueueSync<T>(_ block: () -> T) -> T {
+        if DispatchQueue.getSpecific(key: sessionQueueKey) == sessionQueueID {
+            return block()
+        }
+        return sessionQueue.sync(execute: block)
+    }
+
     fileprivate lazy var frontCameraDevice: AVCaptureDevice? = {
         AVCaptureDevice.videoDevices.filter { $0.position == .front }.first
     }()
@@ -460,9 +491,10 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         // in-flight configuration transaction, which makes AVFoundation raise an
         // uncatchable NSGenericException ("stopRunning may not be called between
         // calls to beginConfiguration and commitConfiguration"). Dispatching it
-        // asynchronously serializes it after any pending transaction, mirroring
-        // how resumeCaptureSession() dispatches startRunning(). The strong
-        // capture keeps the session alive even if it is torn down right after.
+        // asynchronously serializes it after any pending transaction; all
+        // configuration transactions in turn go through _onSessionQueueSync (or
+        // already run on sessionQueue), so they can never interleave with it. The
+        // strong capture keeps the session alive even if it is torn down right after.
         if let validCaptureSession = captureSession {
             sessionQueue.async {
                 if validCaptureSession.isRunning {
@@ -920,12 +952,14 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
     // MARK: - AVCaptureFileOutputRecordingDelegate
     
     public func fileOutput(_: AVCaptureFileOutput, didStartRecordingTo _: URL, from _: [AVCaptureConnection]) {
-        captureSession?.beginConfiguration()
-        if flashMode != .off {
-            _updateIlluminationMode(flashMode)
+        _onSessionQueueSync {
+            captureSession?.beginConfiguration()
+            if flashMode != .off {
+                _updateIlluminationMode(flashMode)
+            }
+
+            captureSession?.commitConfiguration()
         }
-        
-        captureSession?.commitConfiguration()
     }
     
     open func fileOutput(_: AVCaptureFileOutput, didFinishRecordingTo outputFileURL: URL, from _: [AVCaptureConnection], error: Error?) {
@@ -1297,10 +1331,14 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         
         _setupVideoConnection()
         
-        if let captureSession = captureSession, captureSession.canAddOutput(newMovieOutput) {
-            captureSession.beginConfiguration()
-            captureSession.addOutput(newMovieOutput)
-            captureSession.commitConfiguration()
+        if let captureSession = captureSession {
+            _onSessionQueueSync {
+                if captureSession.canAddOutput(newMovieOutput) {
+                    captureSession.beginConfiguration()
+                    captureSession.addOutput(newMovieOutput)
+                    captureSession.commitConfiguration()
+                }
+            }
         }
     }
     
@@ -1331,11 +1369,14 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         }
         let newStillImageOutput = AVCaptureStillImageOutput()
         stillImageOutput = newStillImageOutput
-        if let captureSession = captureSession,
-            captureSession.canAddOutput(newStillImageOutput) {
-            captureSession.beginConfiguration()
-            captureSession.addOutput(newStillImageOutput)
-            captureSession.commitConfiguration()
+        if let captureSession = captureSession {
+            _onSessionQueueSync {
+                if captureSession.canAddOutput(newStillImageOutput) {
+                    captureSession.beginConfiguration()
+                    captureSession.addOutput(newStillImageOutput)
+                    captureSession.commitConfiguration()
+                }
+            }
         }
         return newStillImageOutput
     }
@@ -1601,48 +1642,50 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
     }
     
     fileprivate func _setupOutputMode(_ newCameraOutputMode: CameraOutputMode, oldCameraOutputMode: CameraOutputMode?) {
-        captureSession?.beginConfiguration()
-        
-        if let cameraOutputToRemove = oldCameraOutputMode {
-            // remove current setting
-            switch cameraOutputToRemove {
+        _onSessionQueueSync {
+            captureSession?.beginConfiguration()
+
+            if let cameraOutputToRemove = oldCameraOutputMode {
+                // remove current setting
+                switch cameraOutputToRemove {
+                    case .stillImage:
+                        if let validStillImageOutput = stillImageOutput {
+                            captureSession?.removeOutput(validStillImageOutput)
+                    }
+                    case .videoOnly, .videoWithMic:
+                        if let validMovieOutput = movieOutput {
+                            captureSession?.removeOutput(validMovieOutput)
+                        }
+                        if cameraOutputToRemove == .videoWithMic {
+                            _removeMicInput()
+                    }
+                }
+            }
+
+            _setupOutputs()
+
+            // configure new devices
+            switch newCameraOutputMode {
                 case .stillImage:
-                    if let validStillImageOutput = stillImageOutput {
-                        captureSession?.removeOutput(validStillImageOutput)
+                    let validStillImageOutput = _getStillImageOutput()
+                    if let captureSession = captureSession,
+                        captureSession.canAddOutput(validStillImageOutput) {
+                        captureSession.addOutput(validStillImageOutput)
                 }
                 case .videoOnly, .videoWithMic:
-                    if let validMovieOutput = movieOutput {
-                        captureSession?.removeOutput(validMovieOutput)
+                    let videoMovieOutput = _getMovieOutput()
+                    if let captureSession = captureSession,
+                        captureSession.canAddOutput(videoMovieOutput) {
+                        captureSession.addOutput(videoMovieOutput)
                     }
-                    if cameraOutputToRemove == .videoWithMic {
-                        _removeMicInput()
+
+                    if newCameraOutputMode == .videoWithMic,
+                        let validMic = _deviceInputFromDevice(mic) {
+                        captureSession?.addInput(validMic)
                 }
             }
+            captureSession?.commitConfiguration()
         }
-        
-        _setupOutputs()
-        
-        // configure new devices
-        switch newCameraOutputMode {
-            case .stillImage:
-                let validStillImageOutput = _getStillImageOutput()
-                if let captureSession = captureSession,
-                    captureSession.canAddOutput(validStillImageOutput) {
-                    captureSession.addOutput(validStillImageOutput)
-            }
-            case .videoOnly, .videoWithMic:
-                let videoMovieOutput = _getMovieOutput()
-                if let captureSession = captureSession,
-                    captureSession.canAddOutput(videoMovieOutput) {
-                    captureSession.addOutput(videoMovieOutput)
-                }
-                
-                if newCameraOutputMode == .videoWithMic,
-                    let validMic = _deviceInputFromDevice(mic) {
-                    captureSession?.addInput(validMic)
-            }
-        }
-        captureSession?.commitConfiguration()
         _updateCameraQualityMode(cameraOutputQuality)
         _orientationChanged()
     }
@@ -1821,28 +1864,30 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
     
     fileprivate func _updateCameraDevice(_: CameraDevice) {
         if let validCaptureSession = captureSession {
-            validCaptureSession.beginConfiguration()
-            defer { validCaptureSession.commitConfiguration() }
-            let inputs: [AVCaptureInput] = validCaptureSession.inputs
-            
-            for input in inputs {
-                if let deviceInput = input as? AVCaptureDeviceInput, deviceInput.device != mic {
-                    validCaptureSession.removeInput(deviceInput)
+            _onSessionQueueSync {
+                validCaptureSession.beginConfiguration()
+                defer { validCaptureSession.commitConfiguration() }
+                let inputs: [AVCaptureInput] = validCaptureSession.inputs
+
+                for input in inputs {
+                    if let deviceInput = input as? AVCaptureDeviceInput, deviceInput.device != mic {
+                        validCaptureSession.removeInput(deviceInput)
+                    }
                 }
-            }
-            
-            switch cameraDevice {
-                case .front:
-                    if hasFrontCamera {
-                        if let validFrontDevice = _deviceInputFromDevice(frontCameraDevice),
-                            !inputs.contains(validFrontDevice) {
-                            validCaptureSession.addInput(validFrontDevice)
-                        }
-                }
-                case .back:
-                    if let validBackDevice = _deviceInputFromDevice(backCameraDevice),
-                        !inputs.contains(validBackDevice) {
-                        validCaptureSession.addInput(validBackDevice)
+
+                switch cameraDevice {
+                    case .front:
+                        if hasFrontCamera {
+                            if let validFrontDevice = _deviceInputFromDevice(frontCameraDevice),
+                                !inputs.contains(validFrontDevice) {
+                                validCaptureSession.addInput(validFrontDevice)
+                            }
+                    }
+                    case .back:
+                        if let validBackDevice = _deviceInputFromDevice(backCameraDevice),
+                            !inputs.contains(validBackDevice) {
+                            validCaptureSession.addInput(validBackDevice)
+                    }
                 }
             }
         }
@@ -1857,36 +1902,40 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
     }
     
     fileprivate func _updateTorch(_: CameraFlashMode) {
-        captureSession?.beginConfiguration()
-        defer { captureSession?.commitConfiguration() }
-        for captureDevice in AVCaptureDevice.videoDevices {
-            guard let avTorchMode = AVCaptureDevice.TorchMode(rawValue: flashMode.rawValue) else { continue }
-            if captureDevice.isTorchModeSupported(avTorchMode), cameraDevice == .back {
-                do {
-                    try captureDevice.lockForConfiguration()
-                    
-                    captureDevice.torchMode = avTorchMode
-                    captureDevice.unlockForConfiguration()
-                    
-                } catch {
-                    return
+        _onSessionQueueSync {
+            captureSession?.beginConfiguration()
+            defer { captureSession?.commitConfiguration() }
+            for captureDevice in AVCaptureDevice.videoDevices {
+                guard let avTorchMode = AVCaptureDevice.TorchMode(rawValue: flashMode.rawValue) else { continue }
+                if captureDevice.isTorchModeSupported(avTorchMode), cameraDevice == .back {
+                    do {
+                        try captureDevice.lockForConfiguration()
+
+                        captureDevice.torchMode = avTorchMode
+                        captureDevice.unlockForConfiguration()
+
+                    } catch {
+                        return
+                    }
                 }
             }
         }
     }
     
     fileprivate func _updateFlash(_ flashMode: CameraFlashMode) {
-        captureSession?.beginConfiguration()
-        defer { captureSession?.commitConfiguration() }
-        for captureDevice in AVCaptureDevice.videoDevices {
-            guard let avFlashMode = AVCaptureDevice.FlashMode(rawValue: flashMode.rawValue) else { continue }
-            if captureDevice.isFlashModeSupported(avFlashMode) {
-                do {
-                    try captureDevice.lockForConfiguration()
-                    captureDevice.flashMode = avFlashMode
-                    captureDevice.unlockForConfiguration()
-                } catch {
-                    return
+        _onSessionQueueSync {
+            captureSession?.beginConfiguration()
+            defer { captureSession?.commitConfiguration() }
+            for captureDevice in AVCaptureDevice.videoDevices {
+                guard let avFlashMode = AVCaptureDevice.FlashMode(rawValue: flashMode.rawValue) else { continue }
+                if captureDevice.isFlashModeSupported(avFlashMode) {
+                    do {
+                        try captureDevice.lockForConfiguration()
+                        captureDevice.flashMode = avFlashMode
+                        captureDevice.unlockForConfiguration()
+                    } catch {
+                        return
+                    }
                 }
             }
         }
@@ -1930,12 +1979,14 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
                 }
             }
             
-            if validCaptureSession.canSetSessionPreset(sessionPreset) {
-                validCaptureSession.beginConfiguration()
-                validCaptureSession.sessionPreset = sessionPreset
-                validCaptureSession.commitConfiguration()
-            } else {
-                _show(NSLocalizedString("Preset not supported", comment: ""), message: NSLocalizedString("Camera preset not supported. Please try another one.", comment: ""))
+            _onSessionQueueSync {
+                if validCaptureSession.canSetSessionPreset(sessionPreset) {
+                    validCaptureSession.beginConfiguration()
+                    validCaptureSession.sessionPreset = sessionPreset
+                    validCaptureSession.commitConfiguration()
+                } else {
+                    _show(NSLocalizedString("Preset not supported", comment: ""), message: NSLocalizedString("Camera preset not supported. Please try another one.", comment: ""))
+                }
             }
         } else {
             _show(NSLocalizedString("Camera error", comment: ""), message: NSLocalizedString("No valid capture session found, I can't take any pictures or videos.", comment: ""))
